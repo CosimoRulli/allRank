@@ -15,7 +15,6 @@ logger = get_logger()
 PADDED_Y_VALUE = -1
 PADDED_INDEX_VALUE = -1
 
-
 class ToTensor(object):
     """
     Wrapper for ndarray->Tensor conversion.
@@ -181,20 +180,25 @@ def load_libsvm_role(input_path: str, role: str) -> LibSVMDataset:
     return ds
 
 
-def fix_length_to_longest_slate(ds: LibSVMDataset) -> Compose:
+def fix_length_to_longest_slate(ds: LibSVMDataset, length: int = None) -> Compose:
     """
     Helper function returning a transforms.Compose object performing length fixing and tensor conversion.
 
-    Length fixing operation will fix every slate's length to maximum length present in the LibSVMDataset.
+    Length fixing operation will fix every slate's length to maximum length present in the LibSVMDataset or in.
     :param ds: LibSVMDataset to transform
+    :param length: Int, if given, pad the dataset to this length
     :return: transforms.Compose object
+
     """
-    logger.info("Will pad to the longest slate: {}".format(ds.longest_query_length))
-    return transforms.Compose([FixLength(int(ds.longest_query_length)), ToTensor()])
+    longest_slate = length if length else ds.longest_query_length
+
+    logger.info("Will pad to the longest slate: {}".format(longest_slate))
+
+    return transforms.Compose([FixLength(int(longest_slate)), ToTensor()])
 
 
-def load_libsvm_dataset(input_path: str, slate_length: int, validation_ds_role: str) \
-        -> Tuple[LibSVMDataset, LibSVMDataset]:
+def load_libsvm_dataset(input_path: str, slate_length: int, validation_ds_role: str, test_ds_role: str, sigma: float, shared: bool) \
+        -> Tuple[LibSVMDataset, LibSVMDataset, LibSVMDataset]:
     """
     Helper function loading a train LibSVMDataset and a specified validation LibSVMDataset.
     :param input_path: directory containing the LibSVM files
@@ -203,14 +207,16 @@ def load_libsvm_dataset(input_path: str, slate_length: int, validation_ds_role: 
     :return: tuple of LibSVMDatasets containing train and validation datasets,
         where train slates are padded to slate_length and validation slates to val_ds.longest_query_length
     """
-    train_ds = load_libsvm_dataset_role("train", input_path, slate_length)
+    train_ds = load_libsvm_dataset_role("train", input_path, slate_length, sigma, shared)
 
-    val_ds = load_libsvm_dataset_role(validation_ds_role, input_path, slate_length)
+    val_ds = load_libsvm_dataset_role(validation_ds_role, input_path, slate_length, shared=shared)
 
-    return train_ds, val_ds
+    test_ds = load_libsvm_dataset_role(test_ds_role, input_path, slate_length, shared=shared)
+
+    return train_ds, val_ds, test_ds
 
 
-def load_libsvm_dataset_role(role: str, input_path: str, slate_length: int) -> LibSVMDataset:
+def load_libsvm_dataset_role(role: str, input_path: str, slate_length: int, sigma: float = 0.0, shared: bool = False) -> LibSVMDataset:
     """
     Helper function loading a single role LibSVMDataset
     :param role: the role of the dataset - specifies file name and padding behaviour
@@ -219,14 +225,40 @@ def load_libsvm_dataset_role(role: str, input_path: str, slate_length: int) -> L
     :return: loaded LibSVMDataset
     """
     ds = load_libsvm_role(input_path, role)
+    #This is required when using Linfomer
+    print("Shared in load_libsvm_dataset_role", shared)
+    print("Slate length in load_libsvm_dataset_role", slate_length)
+
+    longest_slate = slate_length if shared else None
+    print("Longest slate in load_libsvm_dataset_role", longest_slate)
     if role == "train":
-        ds.transform = transforms.Compose([FixLength(slate_length), ToTensor()])
+        ds.transform = transforms.Compose([GaussianNoise(mean=0., sigma=sigma), FixLength(slate_length),  ToTensor()])
     else:
-        ds.transform = fix_length_to_longest_slate(ds)
+        ds.transform = fix_length_to_longest_slate(ds, length=longest_slate)
     return ds
 
 
-def create_data_loaders(train_ds: LibSVMDataset, val_ds: LibSVMDataset, num_workers: int, batch_size: int):
+class GaussianNoise(object):
+    """
+    Helper function that adds Gaussian noise to each sample independently
+    """
+    def __init__(self, mean=0., sigma=1.):
+        self.sigma = sigma
+        self.mean = mean
+
+    def __call__(self, sample):
+        x = sample[0]
+        x += np.random.normal(self.mean, self.sigma, x.shape)
+
+        return x, sample[1]
+
+
+    def __repr__(self):
+        return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.sigma)
+
+
+
+def create_data_loaders(train_ds: LibSVMDataset, val_ds: LibSVMDataset, test_ds: LibSVMDataset, num_workers: int, batch_size: int):
     """
     Helper function creating train and validation data loaders with specified number of workers and batch sizes.
     :param train_ds: LibSVMDataset train dataset
@@ -242,5 +274,6 @@ def create_data_loaders(train_ds: LibSVMDataset, val_ds: LibSVMDataset, num_work
 
     # Please note that the batch size for validation dataloader is twice the total_batch_size
     train_dl = DataLoader(train_ds, batch_size=total_batch_size, num_workers=num_workers, shuffle=True)
-    val_dl = DataLoader(val_ds, batch_size=total_batch_size * 2, num_workers=num_workers, shuffle=False)
-    return train_dl, val_dl
+    val_dl = DataLoader(val_ds, batch_size=total_batch_size , num_workers=num_workers, shuffle=False)
+    test_dl = DataLoader(test_ds, batch_size=total_batch_size , num_workers=num_workers, shuffle=False)
+    return train_dl, val_dl, test_dl

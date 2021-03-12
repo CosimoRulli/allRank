@@ -21,6 +21,7 @@ def dump_experiment_result(args: Namespace, config: Config, output_dir: str, res
     flattened_experiment = flatten(final_config_dict, reducer="path")
     result["train_metrics"] = unpack_numpy_values(result["train_metrics"])
     result["val_metrics"] = unpack_numpy_values(result["val_metrics"])
+    result["test_metrics"] = unpack_numpy_values(result["test_metrics"])
     result["num_params"] = result["num_params"].item()
     flattened_result = flatten(result, reducer="path")
     flattened_experiment.update(flattened_result)

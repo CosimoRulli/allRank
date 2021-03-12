@@ -12,6 +12,9 @@ class TransformerConfig:
     h = attrib(type=int)
     positional_encoding = attrib(type=dict)
     dropout = attrib(type=float)
+    proj_size = attrib(type=Optional[int], default=None)
+    linformer = attrib(type=Optional[bool], default=False)
+
 
 
 @attrs
@@ -25,7 +28,8 @@ class FCConfig:
 @attrs
 class PostModelConfig:
     d_output = attrib(type=int)
-    output_activation = attrib(type=str)
+    output_activation = attrib(type=Optional[str])
+    output_activation_score = attrib(type=Optional[str])
 
 
 @attrs
@@ -33,6 +37,7 @@ class ModelConfig:
     fc_model = attrib(type=FCConfig)
     transformer = attrib(type=TransformerConfig)
     post_model = attrib(type=PostModelConfig)
+    pretrained = attrib(type=Optional[str], default=None)
 
 
 @attrs
@@ -48,6 +53,9 @@ class DataConfig:
     batch_size = attrib(type=int)
     slate_length = attrib(type=int)
     validation_ds_role = attrib(type=str)
+    test_ds_role = attrib(type=str)
+    noise = attrib(type=float)
+    shared = attrib(type=Optional[bool], default=False)
 
 
 @attrs
@@ -75,6 +83,8 @@ class Config:
     val_metric = attrib(type=str, default=None)
     expected_metrics = attrib(type=Dict[str, Dict[str, float]], default={})
     detect_anomaly = attrib(type=bool, default=False)
+    distillation_loss = attrib(type=Optional[NameArgsConfig], default=None)
+    teacher_model = attrib(type=Optional[ModelConfig], default=None)
     click_model = attrib(type=Optional[NameArgsConfig], default=None)
 
     @classmethod
@@ -85,18 +95,30 @@ class Config:
 
     @classmethod
     def from_dict(cls, config):
+
         config["model"] = ModelConfig(**config["model"])
         if config["model"].transformer:
             config["model"].transformer = TransformerConfig(**config["model"].transformer)
             if config["model"].transformer.positional_encoding:
                 config["model"].transformer.positional_encoding = PositionalEncoding(
                     **config["model"].transformer.positional_encoding)
+
+        if "teacher_model" in config.keys():
+            config["teacher_model"] = ModelConfig(**config["teacher_model"])
+            if config["teacher_model"].transformer:
+                config["teacher_model"].transformer = TransformerConfig(**config["teacher_model"].transformer)
+                if config["teacher_model"].transformer.positional_encoding:
+                    config["teacher_model"].transformer.positional_encoding = PositionalEncoding(
+                        **config["teacher_model"].transformer.positional_encoding)
+
         config["data"] = DataConfig(**config["data"])
         config["optimizer"] = NameArgsConfig(**config["optimizer"])
         config["training"] = TrainingConfig(**config["training"])
         config["metrics"] = cls._parse_metrics(config["metrics"])
         config["lr_scheduler"] = NameArgsConfig(**config["lr_scheduler"])
         config["loss"] = NameArgsConfig(**config["loss"])
+        if "distillation_loss" in config.keys():
+            config["distillation_loss"] = NameArgsConfig(**config["distillation_loss"])
         if "click_model" in config.keys():
             config["click_model"] = NameArgsConfig(**config["click_model"])
         return cls(**config)

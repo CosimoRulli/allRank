@@ -14,7 +14,6 @@ import torch.nn.functional as F
 from allrank.config import PositionalEncoding
 from allrank.models.positional import _make_positional_encoding
 
-
 def clones(module, N):
     """
     Creation of N identical layers.
@@ -56,6 +55,37 @@ class Encoder(nn.Module):
         return self.norm(x)
 
 
+class EncoderDistillation(nn.Module):
+    """
+    Stack of Transformer encoder blocks with positional encoding.
+    """
+    def __init__(self, layer, N, position):
+        """
+        :param layer: single building block to clone
+        :param N: number of copies
+        :param position: positional encoding module
+        """
+        super(EncoderDistillation, self).__init__()
+        self.layers = clones(layer, N)
+        self.norm = LayerNorm(layer.size)
+        self.position = position
+
+    def forward(self, x, mask, indices):
+        """
+        Forward pass through each block of the Transformer.
+        :param x: input of shape [batch_size, slate_length, input_dim]
+        :param mask: padding mask of shape [batch_size, slate_length]
+        :param indices: original item ranks used in positional encoding, shape [batch_size, slate_length]
+        :return: output of shape [batch_size, slate_length, output_dim]
+        """
+        if self.position:
+            x = self.position(x, mask, indices)
+        mask = mask.unsqueeze(-2)
+        for layer in self.layers:
+            x, attention_scores = layer(x, mask)
+        return self.norm(x), attention_scores
+
+
 class LayerNorm(nn.Module):
     """
     Layer normalization module.
@@ -95,15 +125,48 @@ class SublayerConnection(nn.Module):
         self.norm = LayerNorm(size)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, sublayer):
+    def forward(self, x, sublayer, distillation = False):
         """
         Forward pass through the sublayer connection module, applying the residual connection to any sublayer with the same size.
         :param x: input of shape [batch_size, slate_length, input_dim]
         :param sublayer: layer through which to pass the input prior to applying the sum
         :return: output of shape [batch_size, slate_length, output_dim]
         """
-        return x + self.dropout(
-            sublayer(self.norm(x)))
+        scores = sublayer(self.norm(x))
+
+        if distillation:
+            return x + self.dropout(scores[0]), scores[1]
+        else:
+            return x + self.dropout(scores)
+
+
+class EncoderLayerDistillation(nn.Module):
+    """
+    Single Transformer encoder block made of self-attention and feed-forward layers with residual connections.
+    """
+    def __init__(self, size, self_attn, feed_forward, dropout):
+        """
+        :param size: input/output size of the encoder block
+        :param self_attn: self-attention layer
+        :param feed_forward: feed-forward layer
+        :param dropout: dropout probability
+        """
+        super(EncoderLayerDistillation, self).__init__()
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(SublayerConnection(size, dropout), 2)
+        self.size = size
+
+    def forward(self, x, mask):
+        """
+        Forward pass through the encoder block.
+        :param x: input of shape [batch_size, slate_length, self.size]
+        :param mask: padding mask of shape [batch_size, slate_length]
+        :return: output of shape [batch_size, slate_length, self.size]
+        """
+
+        x, attn_scores = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask, distillation=True), distillation=True)
+        return self.sublayer[1](x, self.feed_forward), attn_scores
 
 
 class EncoderLayer(nn.Module):
@@ -134,6 +197,8 @@ class EncoderLayer(nn.Module):
         return self.sublayer[1](x, self.feed_forward)
 
 
+
+
 def attention(query, key, value, mask=None, dropout=None):
     """
     Basic function for "Scaled Dot Product Attention" computation.
@@ -149,11 +214,11 @@ def attention(query, key, value, mask=None, dropout=None):
 
     if mask is not None:
         scores = scores.masked_fill(mask == 1, float("-inf"))
-
     p_attn = F.softmax(scores, dim=-1)
+
     if dropout is not None:
         p_attn = dropout(p_attn)
-    return torch.matmul(p_attn, value), p_attn
+    return torch.matmul(p_attn, value), p_attn, scores
 
 
 class MultiHeadedAttention(nn.Module):
@@ -175,7 +240,7 @@ class MultiHeadedAttention(nn.Module):
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
 
-    def forward(self, query, key, value, mask=None):
+    def forward(self, query, key, value, mask=None, distillation = False):
         """
         Forward pass through the multi-head attention block.
         :param query: query set of shape [batch_size, slate_size, self.d_model]
@@ -195,11 +260,13 @@ class MultiHeadedAttention(nn.Module):
              for linear, x in zip(self.linears, (query, key, value))]
 
         # 2) Apply attention on all the projected vectors in batch.
-        x, self.attn = attention(query, key, value, mask=mask, dropout=self.dropout)
+        x, self.attn, scores = attention(query, key, value, mask=mask, dropout=self.dropout)
 
         # 3) "Concat" using a view and apply a final linear.
         x = x.transpose(1, 2).contiguous() \
             .view(nbatches, -1, self.h * self.d_k)
+        if distillation:
+            return self.linears[-1](x), scores
         return self.linears[-1](x)
 
 
@@ -227,8 +294,10 @@ class PositionwiseFeedForward(nn.Module):
         return self.w_2(self.dropout(F.relu(self.w_1(x))))
 
 
+from allrank.models.linformer import *
+
 def make_transformer(N=6, d_ff=2048, h=8, dropout=0.1, n_features=136,
-                     positional_encoding: Optional[PositionalEncoding] = None):
+                     positional_encoding: Optional[PositionalEncoding] = None, distillation: bool = False, linformer:bool=False, seq_len:int=None, proj_size:int=None):
     """
     Helper function for instantiating Transformer-based Encoder.
     :param N: number of Transformer blocks
@@ -237,11 +306,17 @@ def make_transformer(N=6, d_ff=2048, h=8, dropout=0.1, n_features=136,
     :param dropout: dropout probability
     :param n_features: number of input/output features of the feed-forward layer
     :param positional_encoding: config.PositionalEncoding object containing PE config
+    :param distillation: whether to create a model for distillation
     :return: Transformer-based Encoder with given hyperparameters
+
     """
     c = copy.deepcopy
-    attn = MultiHeadedAttention(h, n_features, dropout)
 
+    attn = MultiHeadedAttention(h, n_features, dropout) if not linformer else LinformerMultiHeadAttention(h, n_features, seq_len, proj_size, dropout)
+    
     ff = PositionwiseFeedForward(n_features, d_ff, dropout)
     position = _make_positional_encoding(n_features, positional_encoding)
-    return Encoder(EncoderLayer(n_features, c(attn), c(ff), dropout), N, position)
+    if distillation:
+        return EncoderDistillation(EncoderLayerDistillation(n_features, c(attn), c(ff), dropout), N, position)
+    else:
+        return Encoder(EncoderLayer(n_features, c(attn), c(ff), dropout), N, position)

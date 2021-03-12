@@ -19,7 +19,7 @@ def ndcg(y_pred, y_true, ats=None, gain_function=lambda x: torch.pow(2, x) - 1, 
     idcg = dcg(y_true, y_true, ats, gain_function, padding_indicator)
     ndcg_ = dcg(y_pred, y_true, ats, gain_function, padding_indicator) / idcg
     idcg_mask = idcg == 0
-    ndcg_[idcg_mask] = 0.  # if idcg == 0 , set ndcg to 0
+    ndcg_[idcg_mask] = 1.  # if idcg == 0 , set ndcg to 0
 
     assert (ndcg_ < 0.0).sum() >= 0, "every ndcg should be non-negative"
 

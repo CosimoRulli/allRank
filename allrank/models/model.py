@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 from attr import asdict
 
@@ -92,11 +93,72 @@ class LTRModel(nn.Module):
         return self.output_layer.score(self.prepare_for_output(x, mask, indices))
 
 
+
+class LTRModelDistillation(nn.Module):
+    """
+    This class represents a full neural Learning to Rank model with a given encoder model.
+    """
+    def __init__(self, input_layer, encoder, output_layer, fit_size):
+        """
+        :param input_layer: the input block (e.g. FCModel)
+        :param encoder: the encoding block (e.g. transformer.Encoder)
+        :param output_layer: the output block (e.g. OutputLayer)
+        """
+        super(LTRModelDistillation, self).__init__()
+        self.input_layer = input_layer if input_layer else nn.Identity()
+        self.encoder = encoder if encoder else first_arg_id
+        self.output_layer = output_layer
+        self.fit_size = fit_size
+        self.fit_dense = nn.Linear(input_layer.output_size, fit_size) if (fit_size is not None and fit_size != input_layer.output_size) else nn.Identity()
+
+
+    def prepare_for_output(self, x, mask, indices):
+        """
+        Forward pass through the input layer and encoder.
+        :param x: input of shape [batch_size, slate_length, input_dim]
+        :param mask: padding mask of shape [batch_size, slate_length]
+        :param indices: original item ranks used in positional encoding, shape [batch_size, slate_length]
+        :return: encoder distillation output of shape [batch_size, slate_length, encoder_output_dim], [slate_length, slate_length]
+        """
+        return self.encoder(self.input_layer(x), mask, indices)
+
+    def forward(self, x, mask, indices):
+        """
+        Forward pass through the whole LTRModel.
+        :param x: input of shape [batch_size, slate_length, input_dim]
+        :param mask: padding mask of shape [batch_size, slate_length]
+        :param indices: original item ranks used in positional encoding, shape [batch_size, slate_length]
+        :return: model output of shape [batch_size, slate_length, output_dim]
+        """
+        hidden_states, attention_scores = self.prepare_for_output(x, mask, indices)
+
+        r_hidden_states = self.fit_dense(hidden_states)
+
+        return self.output_layer(hidden_states), r_hidden_states, attention_scores
+
+
+
+
+    def score(self, x, mask, indices):
+        """
+        Forward pass through the whole LTRModel and item scoring.
+
+        Used when evaluating listwise metrics in the training loop.
+        :param x: input of shape [batch_size, slate_length, input_dim]
+        :param mask: padding mask of shape [batch_size, slate_length]
+        :param indices: original item ranks used in positional encoding, shape [batch_size, slate_length]
+        :return: scores of shape [batch_size, slate_length]
+        """
+        return self.output_layer.score(self.prepare_for_output(x, mask, indices)[0])
+
+
+
+
 class OutputLayer(nn.Module):
     """
     This class represents an output block reducing the output dimensionality to d_output.
     """
-    def __init__(self, d_model, d_output, output_activation=None):
+    def __init__(self, d_model, d_output, output_activation=None, output_activation_score=None):
         """
         :param d_model: dimensionality of the output layer input
         :param d_output: dimensionality of the output layer output
@@ -105,6 +167,8 @@ class OutputLayer(nn.Module):
         super(OutputLayer, self).__init__()
         self.activation = nn.Identity() if output_activation is None else instantiate_class(
             "torch.nn.modules.activation", output_activation)
+        self.activation_score = nn.Identity() if output_activation_score is None else instantiate_class(
+            "torch.nn.modules.activation", output_activation_score)
         self.d_output = d_output
         self.w_1 = nn.Linear(d_model, d_output)
 
@@ -123,12 +187,12 @@ class OutputLayer(nn.Module):
         :return: output of shape [batch_size, slate_length]
         """
         if self.d_output > 1:
-            return self.forward(x).sum(-1)
+            return self.activation_score(self.forward(x)).sum(-1)
         else:
-            return self.forward(x)
+            return self.activation_score(self.forward(x))
 
 
-def make_model(fc_model, transformer, post_model, n_features):
+def make_model(fc_model, transformer, post_model, n_features, pretrained=None, distillation=False, fit_size = None, seq_len = None):
     """
     Helper function for instantiating LTRModel.
     :param fc_model: FCModel used as input block
@@ -140,12 +204,24 @@ def make_model(fc_model, transformer, post_model, n_features):
     if fc_model:
         fc_model = FCModel(**fc_model, n_features=n_features)  # type: ignore
     d_model = n_features if not fc_model else fc_model.output_size
-    if transformer:
-        transformer = make_transformer(n_features=d_model, **asdict(transformer, recurse=False))  # type: ignore
-    model = LTRModel(fc_model, transformer, OutputLayer(d_model, **post_model))
 
-    # Initialize parameters with Glorot / fan_avg.
-    for p in model.parameters():
-        if p.dim() > 1:
-            nn.init.xavier_uniform_(p)
+    print("Seq len inside make model", seq_len)
+
+    if transformer:
+        if distillation:
+            transformer = make_transformer(n_features=d_model, **asdict(transformer, recurse=False), distillation=True, seq_len=seq_len)
+            model = LTRModelDistillation(fc_model, transformer, OutputLayer(d_model, **post_model), fit_size=fit_size )
+        else:
+            transformer = make_transformer(n_features=d_model, **asdict(transformer, recurse=False), seq_len=seq_len)  # type: ignore
+            model = LTRModel(fc_model, transformer, OutputLayer(d_model, **post_model))
+    else:
+        model = LTRModel(fc_model, transformer, OutputLayer(d_model, **post_model))
+    if pretrained:
+        state_dict = torch.load(pretrained)
+        model.load_state_dict(state_dict)
+    else:
+        # Initialize parameters with Glorot / fan_avg.
+        for p in model.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
     return model
